@@ -66,6 +66,28 @@ def save_debug(out_dir, samples, names):
             n += 1
 
 
+def ensemble_probs(classifiers, crops):
+    """Probabilities for every crop, averaged over all models (ensemble) and over mirrored / zoomed
+    copies of the crop (test-time augmentation, TTA). One row per crop."""
+    variants = [lambda c: c]
+    if TTA_FLIP:
+        variants.append(lambda c: cv2.flip(c, 1))                       # mirror image
+    if TTA_ZOOM:
+        def zoom(c):
+            h, w = c.shape[:2]
+            dy, dx = int(h * 0.05), int(w * 0.05)                       # cut 5 % from every side = closer look
+            return c[dy:h - dy, dx:w - dx] if h - 2 * dy > 8 and w - 2 * dx > 8 else c
+        variants.append(zoom)
+    total, n = None, 0
+    for model in classifiers:
+        for v in variants:
+            res = model.predict([v(c) for c in crops], imgsz=IMAGE_SIZE, verbose=False)
+            p = np.stack([r.probs.data.cpu().numpy() for r in res])
+            total = p if total is None else total + p
+            n += 1
+    return total / n
+
+
 def analyse_video(path, detector, classifier, names):
     """Returns (list of per-sample dicts, duration seconds)."""
     cap = cv2.VideoCapture(str(path))
@@ -107,9 +129,8 @@ def analyse_video(path, detector, classifier, names):
             crops.append(crop)
             meta.append((t, fi, bb, debug_img(crop, t)))
         if crops:
-            res = classifier.predict(crops, imgsz=IMAGE_SIZE, verbose=False)
-            for (t, fi, bb, dbg), r in zip(meta, res):
-                p = r.probs.data.cpu().numpy()
+            probs = ensemble_probs(classifier, crops)
+            for (t, fi, bb, dbg), p in zip(meta, probs):
                 samples.append({"t": t, "i": fi, "probs": p, "box": bb, "crop": dbg})
     samples.sort(key=lambda s: s["t"])
     full_hw = frames[0].shape[:2] if frames else (1, 1)
@@ -419,13 +440,18 @@ def main():
     root = Path(TEST_FOLDER)
     if not root.is_dir():
         sys.exit(f"Test folder not found: {root}")
-    if not Path(WEIGHTS).is_file():
-        sys.exit(f"Model file not found: {WEIGHTS}")
+    weight_files = [WEIGHTS] if isinstance(WEIGHTS, str) else list(WEIGHTS)
+    for w in weight_files:
+        if not Path(w).is_file():
+            sys.exit(f"Model file not found: {w}")
 
     detector = YOLO(DETECTOR)
-    classifier = YOLO(WEIGHTS)
-    names = classifier.names
-    names = [names[i] for i in range(len(names))]
+    classifier = [YOLO(w) for w in weight_files]        # one or more models (ensemble)
+    all_names = [[m.names[i] for i in range(len(m.names))] for m in classifier]
+    if any(n != all_names[0] for n in all_names):
+        sys.exit("The models have different classes or a different class order - they cannot be mixed.")
+    names = all_names[0]
+    print(f"Models: {', '.join(weight_files)} | mirror copy: {TTA_FLIP} | zoom copy: {TTA_ZOOM}")
 
     out = Path(RESULTS_FOLDER)
     (out / "timelines").mkdir(parents=True, exist_ok=True)
@@ -511,7 +537,7 @@ def main():
             # long names get cut, so add the length and a short code: every video gets its own folder
             tag = f"{safe(vp.stem)[:25]}_{dur:.0f}s_{zlib.crc32(vp.name.encode()) % 10000:04d}"
             save_debug(out / "debug" / f"{truth}_{tag}", samples, names)
-        with open(out / "timelines" / f"{truth}_{vp.stem}.csv", "w", newline="") as f:
+        with open(out / "timelines" / f"{truth}_{safe(vp.stem)[:25]}_{zlib.crc32(vp.name.encode()) % 10000:04d}.csv", "w", newline="") as f:
             wr = csv.writer(f)
             wr.writerow(["from_s", "to_s", "behavior", "confidence", "speed_body_lengths_per_s", "sitting_lying_separate", "body_motion"])
             for t0, t1, lab, conf, spd, dlab, mot in wins:
@@ -548,8 +574,11 @@ def main():
 
 
 # =====================  CHANGE THESE IF NEEDED  =====================
-TEST_FOLDER = "test_videos_2"          # test_videos/<class>/<videos>
-WEIGHTS = "behavior_best_v3.pt"      # your trained behavior model (v3)
+TEST_FOLDER = "test_videos_2"         # test_videos/<class>/<videos>
+WEIGHTS = ["behavior_best_v5.pt"]   # one model, or several: their answers are averaged
+                                     # (one model only:  WEIGHTS = "behavior_best_v3.pt")
+TTA_FLIP = False                     # also look at the mirrored crop and average (no retraining needed)
+TTA_ZOOM = False                     # also look at a slightly closer crop and average
 DETECTOR = "yolov8m.pt"              # same cat finder as in training
 DETECT_CONF = 0.15
 PAD = 0.10
@@ -557,7 +586,7 @@ MIN_CROP_SIDE = 64
 IMAGE_SIZE = 224
 SAMPLES_PER_SECOND = 5               # look at 5 frames every second
 WINDOW_SECONDS = 2                   # smoothing: one answer per 2 seconds
-RESULTS_FOLDER = "video_results_v3"
+RESULTS_FOLDER = "video_results_v5_v6_m5"
 SAVE_DEBUG = True                    # save ~1 picture per second in video_results/debug/ (see what the model saw)
 # --- the SPEED RULE: walking vs running -------------------------------------------
 CAMERA_COMPENSATION = True   # subtract the camera's own movement (pan/zoom/shake) from the cat's speed
@@ -571,7 +600,7 @@ RUN_SPEED = 0.50           # body lengths per second; used when AUTO is off or t
 MIN_WINDOWS_FOR_AUTO = 3   # walking and running windows needed before the limit is tuned
 # classes that become ONE output (their probabilities are added before choosing the answer)
 MERGE_GROUPS = {
-    "resting": ["sitting", "lying", "sleeping"],
+    "resting": ["sitting", "lying", "sleeping"],      # 5 outputs. For 6 outputs use ["lying", "sleeping"] (sitting separate)
     "moving": ["walking", "running"],
 }
 # =====================================================================

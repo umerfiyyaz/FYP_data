@@ -3,13 +3,13 @@
 5_test_videos.py - test the behavior model on whole videos it has never seen.
 
 Folder layout (class name = folder name, one behavior per video):
-    test_videos/eating/a.mp4 ...   test_videos/running/b.mp4 ...   (same 8 class names as training)
+    test_videos/eating/a.mp4 ...   test_videos/running/b.mp4 ...   (same class names as training)
 
-For every video: 5 frames/second -> find the cat -> crop -> classify -> average the answers
-over 2-second windows (smoothing) -> one label per window -> one label for the whole video.
-The model says "moving" for walking/running; the cat's SPEED then decides walking or running.
+For every video: frames per second -> find the cat -> crop -> classify -> average the answers
+over windows (smoothing) -> one label per window -> one label for the whole video.
+NO classes are merged: every class the model knows is scored on its own.
 Then it compares with the folder name and prints everything in ONE run:
-per-video results, per-class table, what-was-confused-with-what table, and the speed limit.
+per-video results, per-class table, and what-was-confused-with-what table.
 
 Run:   python 5_test_videos.py
 Needs: pip install ultralytics opencv-python
@@ -112,8 +112,10 @@ def analyse_video(path, detector, classifier, names):
                 p = r.probs.data.cpu().numpy()
                 samples.append({"t": t, "i": fi, "probs": p, "box": bb, "crop": dbg})
     samples.sort(key=lambda s: s["t"])
+    full_hw = frames[0].shape[:2] if frames else (1, 1)
     if CAMERA_COMPENSATION:
-        add_camera_motion(samples, grays, frames[0].shape[:2] if frames else (1, 1))
+        add_camera_motion(samples, grays, full_hw)
+    add_body_motion(samples, grays, full_hw)
     return samples, duration
 
 
@@ -168,6 +170,40 @@ def add_camera_motion(samples, grays, full_hw):
         prev = s
 
 
+def add_body_motion(samples, grays, full_hw):
+    """For each sample: how much the picture INSIDE the cat's box changed since the previous sample
+    (sample["mot"], grey levels 0-255). The camera's movement is removed first when it could be measured.
+    A cat that sleeps hardly changes; a cat that is awake turns its head, flicks ears and tail."""
+    if not grays:
+        return
+    sc = grays[0].shape[1] / full_hw[1]
+    prev = None
+    for s in samples:
+        s["mot"] = None
+        if prev is not None and s["box"] is not None and prev["box"] is not None and s["i"] - prev["i"] == 1:
+            g0, g1 = grays[prev["i"]], grays[s["i"]]
+            m = s.get("cam") if CAMERA_COMPENSATION else None
+            if m is not None:
+                ms = m.copy()
+                ms[:, 2] *= sc
+                g0 = cv2.warpAffine(g0, ms, (g1.shape[1], g1.shape[0]), flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REPLICATE)
+            x1, y1, x2, y2 = [int(v * sc) for v in s["box"]]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(g1.shape[1], x2), min(g1.shape[0], y2)
+            if x2 - x1 >= 8 and y2 - y1 >= 8:
+                a = cv2.GaussianBlur(g0[y1:y2, x1:x2], (5, 5), 0).astype(np.float32)
+                b = cv2.GaussianBlur(g1[y1:y2, x1:x2], (5, 5), 0).astype(np.float32)
+                s["mot"] = float(np.abs(b - a).mean())
+        prev = s
+
+
+def window_motion(samples, t0, t1):
+    """Average body movement in this window (grey levels). None = not enough data."""
+    v = [s["mot"] for s in samples if t0 <= s["t"] < t1 and s.get("mot") is not None]
+    return float(np.mean(v)) if len(v) >= 3 else None
+
+
 def window_speed(samples, t0, t1, compensate=True):
     """How fast the cat moved in this window, in BODY LENGTHS PER SECOND (median).
     The camera's own movement is subtracted: where the cat would be if it stood still in the room
@@ -195,17 +231,16 @@ def window_speed(samples, t0, t1, compensate=True):
 
 
 def windows(samples, duration, names):
-    """2-second windows: average the probabilities of the samples that have a cat.
-    Returns a list of (from, to, label, confidence, speed, separate_label).
-    label = what the app shows (sitting+lying = resting). separate_label = same, but sitting
-    and lying kept apart, so you can see which of them is weak. 'moving' is split later by speed."""
+    """Windows: average the probabilities of the samples that have a cat.
+    Returns a list of (from, to, label, confidence, speed, separate_label, body_motion).
+    No classes are merged, so label and separate_label are the same."""
     out = []
     n_win = max(1, int(np.ceil(duration / WINDOW_SECONDS)))
     for w in range(n_win):
         t0, t1 = w * WINDOW_SECONDS, (w + 1) * WINDOW_SECONDS
         got = [s["probs"] for s in samples if t0 <= s["t"] < t1 and s["probs"] is not None]
         if not got:
-            out.append((t0, t1, None, 0.0, None, None))
+            out.append((t0, t1, None, 0.0, None, None, None))
             continue
         avg = np.mean(got, axis=0)
         grouped, grouped_d = {}, {}
@@ -227,17 +262,56 @@ def windows(samples, duration, names):
                 grouped, grouped_d = still_g, still_d
         best = max(grouped, key=grouped.get)
         best_d = max(grouped_d, key=grouped_d.get)
-        out.append((t0, t1, best, grouped[best], spd, best_d))
+        out.append((t0, t1, best, grouped[best], spd, best_d, window_motion(samples, t0, t1)))
     return out
 
 
-def apply_speed_rule(wins, thr):
-    """The speed rule: a 'moving' window is running if fast, walking if slow (or speed unknown)."""
+def apply_speed_rule(wins, thr, sleep_thr=None):
+    """Speed rule (only if SPLIT_MOVING): a 'moving' window is running if fast, walking if slow.
+    Sleep rule (only if sleep_thr is set): resting/sleeping windows are split by body motion.
+    With no merging and both rules off, the labels stay exactly as the model said them."""
     def fix(lab, spd):
         if lab == "moving" and SPLIT_MOVING:
             return "running" if (spd is not None and spd >= thr) else "walking"
         return lab
-    return [(t0, t1, fix(lab, spd), conf, spd, fix(dlab, spd)) for t0, t1, lab, conf, spd, dlab in wins]
+
+    def sleep_fix(lab, mot):
+        if sleep_thr is not None and mot is not None and lab in ("resting", "sleeping"):
+            return "sleeping" if mot < sleep_thr else "resting"
+        return lab
+    return [(t0, t1, sleep_fix(fix(lab, spd), mot), conf, spd, fix(dlab, spd), mot)
+            for t0, t1, lab, conf, spd, dlab, mot in wins]
+
+
+def find_sleep_limit(results):
+    """Body movement of windows the model put in resting/sleeping: truly sleeping clips versus
+    sitting/lying clips. Prints how well the two can be told apart, and the best limit."""
+    grp = {"sleeping": [], "awake resting (sitting+lying)": []}
+    for r in results:
+        key = ("sleeping" if r["truth"] == "sleeping"
+               else "awake resting (sitting+lying)" if r["truth"] in ("sitting", "lying") else None)
+        if key:
+            grp[key] += [w[6] for w in r["wins"] if w[2] in ("resting", "sleeping") and w[6] is not None]
+    print("\nBODY MOVEMENT inside the cat's box (grey levels; small = the cat hardly moves):")
+    arrs = {}
+    for name, v in grp.items():
+        arr = np.array(v)
+        arrs[name] = arr
+        if len(arr) == 0:
+            print(f"  {name:<30}: no data")
+        else:
+            q = np.percentile(arr, [10, 50, 90])
+            print(f"  {name:<30}: {len(arr):>3} windows | 10%={q[0]:.2f}  median={q[1]:.2f}  90%={q[2]:.2f}")
+    sl, aw = arrs["sleeping"], arrs["awake resting (sitting+lying)"]
+    if len(sl) < MIN_WINDOWS_FOR_AUTO or len(aw) < MIN_WINDOWS_FOR_AUTO:
+        return None
+    best = None
+    cand = np.unique(np.concatenate([sl, aw]))
+    for thr in np.concatenate([[cand.min() - 1e-6], (cand[:-1] + cand[1:]) / 2, [cand.max() + 1e-6]]):
+        bal = (float((sl < thr).mean()) + float((aw >= thr).mean())) / 2
+        if best is None or bal > best[0] + 1e-9:
+            best = (bal, float(thr), float((sl < thr).mean()), float((aw >= thr).mean()))
+    return best[1], best[0], best[2], best[3]
 
 
 def find_speed_limit(results):
@@ -351,6 +425,7 @@ def main():
     classifier = YOLO(WEIGHTS)
     names = classifier.names
     names = [names[i] for i in range(len(names))]
+    print(f"  model classes: {', '.join(names)}")
 
     out = Path(RESULTS_FOLDER)
     (out / "timelines").mkdir(parents=True, exist_ok=True)
@@ -370,7 +445,7 @@ def main():
     if not results:
         sys.exit("No videos found. Put them in test_videos/<class>/")
 
-    # ---- the speed limit ----
+    # ---- the speed limit (only used when SPLIT_MOVING is True) ----
     thr, note = RUN_SPEED, f"fixed value RUN_SPEED = {RUN_SPEED}"
     if SPLIT_MOVING:
         found = find_speed_limit(results)
@@ -383,12 +458,30 @@ def main():
                     f"using the fixed value {RUN_SPEED}")
         print(f"  speed limit used: {note}")
 
+    # ---- the sleep limit (body movement) ----
+    sleep_thr = None
+    found_s = find_sleep_limit(results) if SLEEP_MOTION_LIMIT is not None else None
+    if SLEEP_MOTION_LIMIT == "auto":
+        if found_s:
+            sleep_thr = found_s[0]
+            print(f"  sleep rule ON, limit = {sleep_thr:.2f}: {100 * found_s[2]:.0f}% of sleeping windows and "
+                  f"{100 * found_s[3]:.0f}% of sitting/lying windows are on the right side. It was tuned on THESE "
+                  f"clips, so it is optimistic - test it on new clips before you trust it.")
+        else:
+            print(f"  sleep rule OFF: not enough sleeping and sitting/lying windows to find a limit "
+                  f"(need {MIN_WINDOWS_FOR_AUTO} of each).")
+    elif SLEEP_MOTION_LIMIT:
+        sleep_thr = float(SLEEP_MOTION_LIMIT)
+        print(f"  sleep rule ON, fixed limit SLEEP_MOTION_LIMIT = {sleep_thr:.2f}")
+    else:
+        print("  sleep rule OFF.")
+
     # ---- pass 2: final labels, scores, files ----
     print("\nRESULT PER VIDEO")
     rows, rows_d, conf_tab, conf_tab_d, per_video = [], [], {}, {}, []
     for r in results:
         truth, vp, samples, dur = r["truth"], r["vp"], r["samples"], r["dur"]
-        wins = apply_speed_rule(r["wins"], thr)
+        wins = apply_speed_rule(r["wins"], thr, sleep_thr)
         labelled = [w for w in wins if w[2] is not None]
         for w in wins:
             row = conf_tab.setdefault(merge(truth), {})
@@ -420,9 +513,10 @@ def main():
             save_debug(out / "debug" / f"{truth}_{tag}", samples, names)
         with open(out / "timelines" / f"{truth}_{vp.stem}.csv", "w", newline="") as f:
             wr = csv.writer(f)
-            wr.writerow(["from_s", "to_s", "behavior", "confidence", "speed_body_lengths_per_s", "sitting_lying_separate"])
-            for t0, t1, lab, conf, spd, dlab in wins:
-                wr.writerow([t0, t1, lab or "no cat", f"{conf:.2f}", "" if spd is None else f"{spd:.2f}", dlab or "no cat"])
+            wr.writerow(["from_s", "to_s", "behavior", "confidence", "speed_body_lengths_per_s", "sitting_lying_separate", "body_motion"])
+            for t0, t1, lab, conf, spd, dlab, mot in wins:
+                wr.writerow([t0, t1, lab or "no cat", f"{conf:.2f}", "" if spd is None else f"{spd:.2f}",
+                             dlab or "no cat", "" if mot is None else f"{mot:.2f}"])
         flag = "OK   " if merge(pred) == merge(truth) else "WRONG"
         print(f"  [{flag}] {truth}/{vp.name}: predicted {pred}  "
               f"({ok_w}/{len(labelled)} windows right, no cat {no_cat:.0f}%)")
@@ -432,15 +526,17 @@ def main():
         wr.writeheader()
         wr.writerows(rows)
 
-    # ---- the main tables (what the app shows) ----
-    class_table("PER CLASS  (merged outputs: " + ", ".join(
-        f"{'+'.join(v)}={k}" for k, v in scoring_groups().items()) + ")", rows, merge)
+    # ---- the main tables ----
+    groups = scoring_groups()
+    merged_txt = (", ".join(f"{'+'.join(v)}={k}" for k, v in groups.items())
+                  if groups else "NO classes merged - every class scored on its own")
+    class_table("PER CLASS  (" + merged_txt + ")", rows, merge)
     confusion_table("WINDOWS: rows = TRUE class, columns = what the model said", conf_tab)
 
     # ---- the diagnostic tables: sitting and lying kept apart ----
     if SHOW_SITTING_LYING_SEPARATE:
-      class_table("SAME RESULTS WITH SITTING AND LYING SEPARATE  (to see which one is weak)", rows_d, merge_d)
-      confusion_table("WINDOWS (sitting and lying separate): rows = TRUE class, columns = what the model said", conf_tab_d)
+        class_table("SAME RESULTS WITH SITTING AND LYING SEPARATE  (to see which one is weak)", rows_d, merge_d)
+        confusion_table("WINDOWS (sitting and lying separate): rows = TRUE class, columns = what the model said", conf_tab_d)
 
     # ---- per video ----
     print("\nPER VIDEO (true class | seconds | what it said | average confidence)")
@@ -454,8 +550,8 @@ def main():
 
 
 # =====================  CHANGE THESE IF NEEDED  =====================
-TEST_FOLDER = "test_videos_2"          # test_videos/<class>/<videos>
-WEIGHTS = "behavior_best_v3.pt"      # your trained behavior model (v2)
+TEST_FOLDER = "test_videos_1"          # test_videos/<class>/<videos>
+WEIGHTS = "behavior_best_v3.pt"      # your trained behavior model (v3)
 DETECTOR = "yolov8m.pt"              # same cat finder as in training
 DETECT_CONF = 0.15
 PAD = 0.10
@@ -463,21 +559,19 @@ MIN_CROP_SIDE = 64
 IMAGE_SIZE = 224
 SAMPLES_PER_SECOND = 5               # look at 5 frames every second
 WINDOW_SECONDS = 2                   # smoothing: one answer per 2 seconds
-RESULTS_FOLDER = "video_results_v3"
-SAVE_DEBUG = True                    # save ~1 picture per second in video_results/debug/ (see what the model saw)
+RESULTS_FOLDER = "video_results_all_classes"   # new name so old results are not overwritten
+SAVE_DEBUG = True                    # save ~1 picture per second in <results>/debug/ (see what the model saw)
 # --- the SPEED RULE: walking vs running -------------------------------------------
 CAMERA_COMPENSATION = True   # subtract the camera's own movement (pan/zoom/shake) from the cat's speed
 STILL_SPEED = 0.10           # cat moved less than this (body lengths/s, camera removed) -> NOT walking/running. 0 = off
-SPLIT_MOVING = False       # False: walking+running = ONE output "moving" (the 6 app classes). True: speed splits walking/running
-SHOW_SITTING_LYING_SEPARATE = False   # True: also print tables with sitting and lying apart (to see which one is weak)
-AUTO_SPEED_LIMIT = True    # True: find the best speed limit from your walking/ and running/ test videos
-RUN_SPEED = 0.50           # body lengths per second; used when AUTO is off or there is too little data
-MIN_WINDOWS_FOR_AUTO = 3   # walking and running windows needed before the limit is tuned
-# classes that become ONE output (their probabilities are added before choosing the answer)
-MERGE_GROUPS = {
-    "resting": ["sitting", "lying"],
-    "moving": ["walking", "running"],
-}
+SLEEP_MOTION_LIMIT = None    # None = off. "auto" or a number = split resting/sleeping by body motion
+SPLIT_MOVING = False         # only used with a "moving" class; leave False
+SHOW_SITTING_LYING_SEPARATE = False   # sitting/lying are no longer merged, so this is not needed
+AUTO_SPEED_LIMIT = True
+RUN_SPEED = 0.50
+MIN_WINDOWS_FOR_AUTO = 3
+# NO MERGING: every class the model knows is scored on its own
+MERGE_GROUPS = {}
 # =====================================================================
 
 if __name__ == "__main__":
